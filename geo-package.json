@@ -1,0 +1,13 @@
+{
+  "name": "collanduni-geo-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Render API serving SA location autocomplete (provinces, cities, suburbs, schools, places) from za.json in the startedupco/geo GitHub repo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
