@@ -3,6 +3,8 @@
 // Deploy on Render as a Web Service (see README.md).
 
 const http = require('http');
+const crypto = require('crypto');
+const sha256 = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
 
 const PORT = process.env.PORT || 8080;
 const REPO = process.env.GITHUB_REPO || 'startedupco/geo';
@@ -58,6 +60,121 @@ function send(res, status, body) {
 }
 
 function str(v) { return String(v || '').trim().toLowerCase(); }
+
+const API_KEYS = (process.env.API_KEYS || process.env.API_KEY || '').split(',').map((s) => s.trim()).filter(Boolean);
+const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const KEY_CACHE_TTL = Number(process.env.KEY_CACHE_TTL_MS || 5 * 60 * 1000);
+const keyCache = new Map(); // hash -> { at, row }
+
+function supaHeaders(extra) {
+  return Object.assign({
+    apikey: SUPABASE_SERVICE_KEY,
+    Authorization: 'Bearer ' + SUPABASE_SERVICE_KEY,
+    'Content-Type': 'application/json',
+  }, extra);
+}
+
+async function findDbKey(raw) {
+  const hash = sha256(raw);
+  const hit = keyCache.get(hash);
+  if (hit && Date.now() - hit.at < KEY_CACHE_TTL) return hit.row;
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
+  const r = await fetch(SUPABASE_URL + '/rest/v1/api_keys?key_hash=eq.' + hash + '&active=eq.true&select=id,label,email,tier,calls', { headers: supaHeaders() });
+  if (!r.ok) return null;
+  const rows = await r.json().catch(() => []);
+  const row = rows[0] || null;
+  if (row) keyCache.set(hash, { at: Date.now(), row });
+  return row;
+}
+
+function touchDbKey(row) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY || !row) return;
+  row.calls = (row.calls || 0) + 1;
+  fetch(SUPABASE_URL + '/rest/v1/api_keys?id=eq.' + row.id, {
+    method: 'PATCH', headers: supaHeaders(),
+    body: JSON.stringify({ calls: row.calls, last_used_at: new Date().toISOString() }),
+  }).catch(() => {});
+}
+
+// returns { source:'open'|'env'|'db', ... } or null
+function extractKey(req, u) {
+  const h = req.headers['authorization'] || '';
+  const m = String(h).match(/^Bearer\s+(.+)$/i);
+  if (m) return m[1].trim();
+  return req.headers['x-api-key'] || u.searchParams.get('key');
+}
+
+async function authorized(req, u) {
+  const strict = API_KEYS.length > 0 || (SUPABASE_URL && SUPABASE_SERVICE_KEY);
+  if (!strict) return { source: 'open' };
+  const k = extractKey(req, u);
+  if (!k) return null;
+  if (API_KEYS.includes(String(k))) return { source: 'env' };
+  const row = await findDbKey(String(k)).catch(() => null);
+  if (row) return { source: 'db', row };
+  return null;
+}
+
+function readBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > (maxBytes || 10240)) { reject(new Error('Body too large.')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function newRawKey() {
+  return 'ck_' + crypto.randomBytes(32).toString('hex');
+}
+
+async function handleAdmin(req, res, u) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    return send(res, 503, { error: 'Supabase not configured. Set SUPABASE_URL + SUPABASE_SERVICE_KEY.' });
+  }
+  if (u.pathname === '/api/admin/keys' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req)) || {}; } catch (e) { return send(res, 400, { error: 'Invalid JSON body.' }); }
+    const raw = newRawKey();
+    const r = await fetch(SUPABASE_URL + '/rest/v1/api_keys', {
+      method: 'POST', headers: supaHeaders({ Prefer: 'return=representation' }),
+      body: JSON.stringify({
+        key_prefix: raw.slice(0, 12),
+        key_hash: sha256(raw),
+        label: String(body.label || '').slice(0, 100),
+        email: String(body.email || '').slice(0, 160),
+        tier: String(body.tier || 'free').slice(0, 40),
+      }),
+    });
+    if (!r.ok) return send(res, 502, { error: 'Supabase insert failed: HTTP ' + r.status });
+    const rows = await r.json().catch(() => []);
+    return send(res, 200, { key: raw, id: rows[0] && rows[0].id, warning: 'Copy the key now — only its hash is stored and it cannot be shown again.' });
+  }
+  if (u.pathname === '/api/admin/keys' && req.method === 'GET') {
+    const r = await fetch(SUPABASE_URL + '/rest/v1/api_keys?select=id,key_prefix,label,email,tier,active,calls,last_used_at,created_at&order=created_at.desc&limit=100', { headers: supaHeaders() });
+    if (!r.ok) return send(res, 502, { error: 'Supabase read failed: HTTP ' + r.status });
+    return send(res, 200, { keys: await r.json() });
+  }
+  if (u.pathname === '/api/admin/keys/revoke' && req.method === 'POST') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req)) || {}; } catch (e) { return send(res, 400, { error: 'Invalid JSON body.' }); }
+    if (!body.id) return send(res, 400, { error: 'Missing id.' });
+    const r = await fetch(SUPABASE_URL + '/rest/v1/api_keys?id=eq.' + encodeURIComponent(body.id), {
+      method: 'PATCH', headers: supaHeaders(), body: JSON.stringify({ active: false }),
+    });
+    if (!r.ok) return send(res, 502, { error: 'Supabase update failed: HTTP ' + r.status });
+    keyCache.clear();
+    return send(res, 200, { ok: true, revoked: body.id });
+  }
+  return send(res, 404, { error: 'Admin routes: POST /api/admin/keys, GET /api/admin/keys, POST /api/admin/keys/revoke' });
+}
 function page(items, params) {
   const total = items.length;
   const offset = Math.max(0, Number(params.get('offset')) || 0);
@@ -132,26 +249,36 @@ const server = http.createServer(async function (req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, X-API-Key, X-Admin-Key',
     });
     return res.end();
+  }
+  if (u.pathname === '/api/health') {
+    return send(res, 200, {
+      ok: true,
+      service: 'collanduni-geo-api',
+      repo: REPO,
+      branch: BRANCH,
+      cached: !!cache,
+      now: new Date().toISOString(),
+    });
+  }
+  if (u.pathname.startsWith('/api/admin/')) {
+    if (req.method !== 'GET' && req.method !== 'POST') return send(res, 405, { error: 'Admin supports GET and POST only.' });
+    if (!ADMIN_KEY || req.headers['x-admin-key'] !== ADMIN_KEY) return send(res, 403, { error: 'Admin only.' });
+    return handleAdmin(req, res, u);
   }
   if (req.method !== 'GET') {
     return send(res, 405, { error: 'Only GET is supported.' });
   }
+  const auth = await authorized(req, u);
+  if (!auth) {
+    return send(res, 401, { error: { code: 'UNAUTHORIZED', message: 'Missing Bearer token or X-API-Key' } });
+  }
+  if (auth.source === 'db') touchDbKey(auth.row);
 
   try {
-    if (u.pathname === '/api/health') {
-      return send(res, 200, {
-        ok: true,
-        service: 'collanduni-geo-api',
-        repo: REPO,
-        branch: BRANCH,
-        cached: !!cache,
-        now: new Date().toISOString(),
-      });
-    }
     if (u.pathname === '/api/geo/provinces') {
       const r = await handleProvinces();
       return send(res, r.status, r.body);
@@ -178,7 +305,7 @@ const server = http.createServer(async function (req, res) {
   }
 });
 
-server.listen(PORT, function () {
+server.listen(PORT, '0.0.0.0', function () {
   console.log('collanduni geo API listening on :' + PORT);
   console.log('Serving ' + REPO + '/' + FILE + ' @ ' + BRANCH + (TOKEN ? ' (authenticated)' : ' (public raw)'));
 });
